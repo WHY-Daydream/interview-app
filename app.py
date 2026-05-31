@@ -5,9 +5,22 @@ import logging
 import os
 import sys
 import threading
+import traceback
 from pathlib import Path
 from datetime import date as date_today
 from typing import Optional
+
+# ── 启动诊断（写入文件，避免 stdout/stderr 不被 Railway 捕获） ──
+_STARTUP_LOG = Path("/app/data/startup.log")
+try:
+    _STARTUP_LOG.parent.mkdir(parents=True, exist_ok=True)
+    _STARTUP_LOG.write_text(
+        f"[{__import__('datetime').datetime.now().isoformat()}] app.py loaded\n",
+        encoding="utf-8",
+    )
+except Exception as exc:
+    # 可能 volume 还没挂载，忽略
+    pass
 
 # ── 编码修复（Windows GBK 兼容） ──
 # sys.stdout.reconfigure(encoding="utf-8")  # type: ignore  # Railway 容器不支持
@@ -2294,21 +2307,37 @@ def main_page():
 
 # ── 启动 ──
 if __name__ in {"__main__", "__mp_main__"}:
-    logger.info("=" * 50)
-    logger.info("启动应用: %s", settings.APP_TITLE)
-    logger.info("访问地址: http://%s:%s", settings.APP_HOST, settings.APP_PORT)
-    logger.info("=" * 50)
+    try:
+        logger.info("=" * 50)
+        logger.info("启动应用: %s", settings.APP_TITLE)
+        logger.info("访问地址: http://%s:%s", settings.APP_HOST, settings.APP_PORT)
+        logger.info("=" * 50)
 
-    # 自动扫描导入面试题 markdown 文件
-    auto_scan_import()
+        # 自动扫描导入面试题 markdown 文件
+        auto_scan_import()
 
-    ui.run(
-        title=settings.APP_TITLE,
-        host=settings.APP_HOST,
-        port=settings.APP_PORT,
-        dark=settings.APP_DARK_MODE,
-        language=settings.APP_LANGUAGE,
-        favicon="📚",
-        show=False,
-        storage_secret=settings.STORAGE_SECRET,
-    )
+        ui.run(
+            title=settings.APP_TITLE,
+            host=settings.APP_HOST,
+            port=settings.APP_PORT,
+            storage_secret=settings.STORAGE_SECRET,
+            show=False,
+            reload=False,
+            dark=settings.APP_DARK_MODE,
+            language=settings.APP_LANGUAGE,
+            favicon="📝",
+            reconnect_timeout=30.0,
+        )
+    except Exception:
+        _msg = traceback.format_exc()
+        # 写入诊断文件 + stderr
+        sys.stderr.write(f"[FATAL] {_msg}\n")
+        sys.stderr.flush()
+        try:
+            _STARTUP_LOG.write_text(
+                f"[{__import__('datetime').datetime.now().isoformat()}] CRASH:\n{_msg}\n",
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+        raise  # 让容器以非零状态退出，触发 Railway 重启循环
