@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from datetime import date as date_today
 from typing import Optional
@@ -23,6 +24,15 @@ logger = logging.getLogger(__name__)
 # ── 全局状态 ──
 CURRENT_TASK_ID: Optional[str] = None
 CURRENT_TIMER = None  # 当前轮询定时器
+_TIMER_ROOT = None  # 定时器根容器（main_page 中初始化，parent slot 永不删除）
+_NAV_TABS = None  # 导航 tab 引用（用于跨页面跳转）
+GEN_NOTIFY = None  # 当前生成进度通知对象（可 dismiss）
+_stream_step_mds: dict[int, ui.markdown] = {}  # 流式步骤 markdown 引用
+_result_step_mds: dict[int, ui.markdown] = {}  # 结果步骤 markdown 引用
+_stream_status_labels: dict[int, ui.label] = {}  # 流式步骤状态标签
+_stream_status_icons: dict[int, ui.icon] = {}  # 流式步骤状态图标
+_result_status_labels: dict[int, ui.label] = {}  # 结果步骤状态标签（展开项内）
+_result_expansions: dict[int, ui.expansion] = {}  # 结果步骤展开项引用
 JOB_POSITIONS = [
     "AI大模型开发工程师",
     "Java 后端开发",
@@ -195,7 +205,6 @@ def inject_global_styles():
         box-shadow: var(--shadow-sm) !important;
         border: 1px solid var(--border) !important;
         transition: var(--transition);
-        overflow: hidden;
       }
       .card-note:hover, .card-modern:hover { box-shadow: var(--shadow-md) !important; }
 
@@ -350,6 +359,54 @@ def inject_global_styles():
       .markdown-content hr { border: none; border-top: 1px solid var(--divider); margin: 24px 0; }
 
       /* ════════════════════════════════════════════
+         步骤卡片 — 独立显示 + 可滚动
+         ════════════════════════════════════════════ */
+      .step-card {
+        background: var(--surface-card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        transition: var(--transition);
+        overflow: hidden;
+      }
+      .step-card-active {
+        border-color: var(--accent) !important;
+        box-shadow: 0 0 0 3px rgba(37,99,235,0.1), var(--shadow-sm);
+      }
+      .step-card-done {
+        border-color: var(--green);
+      }
+      .step-content-scroll {
+        max-height: none;
+        overflow-y: visible;
+        overflow-x: auto;
+      }
+      .step-content-scroll::-webkit-scrollbar { width: 5px; height: 5px; }
+      .step-content-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+      /* 结果展开区 — 无高度限制 */
+      .step-result-scroll {
+        min-height: 120px;
+        overflow-y: visible;
+        overflow-x: auto;
+      }
+      /* 每个步骤展开项内部卡片 */
+      .step-result-scroll .markdown-content {
+        max-height: none !important;
+      }
+      /* 步骤展开项的头部失败/成功标记 */
+      .step-expansion-done .q-expansion-item__toggle-icon { color: var(--green); }
+      .step-expansion-failed .q-expansion-item__toggle-icon { color: var(--rose); }
+
+      /* ════════════════════════════════════════════
+         渐变分隔线
+         ════════════════════════════════════════════ */
+      .divider-gradient {
+        border: none;
+        height: 1px;
+        background: linear-gradient(90deg, transparent, var(--border), transparent);
+        margin: 12px 0;
+      }
+
+      /* ════════════════════════════════════════════
          弹窗
          ════════════════════════════════════════════ */
       .dialog-modern .q-dialog__inner { backdrop-filter: blur(4px); }
@@ -357,6 +414,11 @@ def inject_global_styles():
         border-radius: var(--radius-lg) !important;
         box-shadow: var(--shadow-xl) !important;
         border: 1px solid var(--border) !important;
+      }
+      /* 宽弹窗（查看历史详情） */
+      .dialog-wide .q-card {
+        max-width: 900px !important;
+        width: 90vw !important;
       }
 
       /* ════════════════════════════════════════════
@@ -399,6 +461,122 @@ def inject_global_styles():
       .text-muted { color: var(--text-muted) !important; }
 
       /* ════════════════════════════════════════════
+         删除按钮
+         ════════════════════════════════════════════ */
+      .btn-delete {
+        border-radius: var(--radius-sm) !important;
+        padding: 6px 12px !important;
+        font-size: 12px !important;
+        font-weight: 500 !important;
+        background: transparent !important;
+        color: var(--text-muted) !important;
+        border: 1px solid transparent !important;
+        transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+        text-transform: none !important;
+      }
+      .btn-delete:hover {
+        background: #fef2f2 !important;
+        color: #dc2626 !important;
+        border-color: #fecaca !important;
+        box-shadow: 0 0 0 3px rgba(220,38,38,0.08) !important;
+      }
+      body.dark .btn-delete:hover {
+        background: rgba(127,29,29,0.3) !important;
+        border-color: rgba(252,165,165,0.2) !important;
+        color: #fca5a5 !important;
+        box-shadow: 0 0 0 3px rgba(252,165,165,0.08) !important;
+      }
+      .btn-delete .q-btn__icon { font-size: 15px !important; transition: transform 0.2s ease; }
+      .btn-delete:hover .q-btn__icon { transform: scale(1.15); }
+
+      /* 纯图标删除按钮 */
+      .btn-delete-icon {
+        border-radius: 8px !important;
+        padding: 4px !important;
+        min-width: 32px !important;
+        height: 32px !important;
+        background: transparent !important;
+        color: var(--text-muted) !important;
+        transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1) !important;
+      }
+      .btn-delete-icon .q-btn__icon { font-size: 18px !important; }
+      .btn-delete-icon:hover {
+        background: #fef2f2 !important;
+        color: #dc2626 !important;
+      }
+      body.dark .btn-delete-icon:hover {
+        background: rgba(127,29,29,0.3) !important;
+        color: #fca5a5 !important;
+      }
+
+      /* ════════════════════════════════════════════
+         删除确认弹窗
+         ════════════════════════════════════════════ */
+      .delete-dialog .q-dialog__inner { backdrop-filter: blur(6px); }
+      .delete-dialog .q-card {
+        border-radius: var(--radius-lg) !important;
+        box-shadow: var(--shadow-xl) !important;
+        border: 1px solid var(--border) !important;
+        overflow: hidden;
+      }
+      .delete-dialog-top-bar {
+        height: 4px;
+        background: linear-gradient(90deg, #f87171, #ef4444, #dc2626);
+      }
+      .delete-dialog-icon {
+        width: 52px;
+        height: 52px;
+        border-radius: 50%;
+        background: #fef2f2;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        margin-bottom: 4px;
+      }
+      body.dark .delete-dialog-icon { background: rgba(127,29,29,0.3); }
+      .delete-dialog-detail {
+        display: inline-block !important;
+        background: var(--surface-alt) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: var(--radius-sm) !important;
+        padding: 8px 16px !important;
+        font-size: 13px !important;
+        font-weight: 500 !important;
+        color: var(--text) !important;
+        line-height: 1.5 !important;
+      }
+      .delete-dialog-cancel {
+        border-radius: var(--radius-sm) !important;
+        padding: 8px 20px !important;
+        font-weight: 500 !important;
+        font-size: 13px !important;
+        border: 1.5px solid var(--border) !important;
+        background: var(--surface) !important;
+        color: var(--text-secondary) !important;
+        transition: var(--transition) !important;
+        text-transform: none !important;
+      }
+      .delete-dialog-cancel:hover { border-color: var(--text-muted) !important; }
+      .delete-dialog-confirm {
+        border-radius: var(--radius-sm) !important;
+        padding: 8px 20px !important;
+        font-weight: 600 !important;
+        font-size: 13px !important;
+        background: #dc2626 !important;
+        color: #fff !important;
+        border: none !important;
+        transition: var(--transition) !important;
+        text-transform: none !important;
+        box-shadow: 0 2px 8px rgba(220,38,38,0.25) !important;
+      }
+      .delete-dialog-confirm:hover {
+        background: #b91c1c !important;
+        box-shadow: 0 4px 14px rgba(220,38,38,0.35) !important;
+        transform: translateY(-1px);
+      }
+      .delete-dialog-confirm:active { transform: translateY(0); }
+
+      /* ════════════════════════════════════════════
          响应式
          ════════════════════════════════════════════ */
       @media (max-width: 768px) {
@@ -407,7 +585,11 @@ def inject_global_styles():
         .page-wrap { padding: 16px 12px 40px; }
       }
     </style>
-    """)
+    """, shared=True)
+
+
+# 注入全局 CSS（模块级，只执行一次）
+inject_global_styles()
 
 
 # ══════════════════════════════════════════════════
@@ -496,11 +678,7 @@ def build_home_page():
             ).props("border")
 
         # 按钮行
-        with ui.row().classes("w-full justify-between items-center mt-5"):
-            ui.label().bind_text_from(form_state, "notes", lambda v: f"📊 笔记长度：{len(v or '')} 字符").classes(
-                "text-sm text-secondary"
-            )
-
+        with ui.row().classes("w-full justify-end mt-5"):
             with ui.row().classes("gap-3"):
                 ui.button("清空", icon="delete", color="grey").props("flat").classes("btn-ghost").on("click", _clear_form)
                 ui.button("开始生成面试题", icon="auto_awesome", color="primary").on(
@@ -508,15 +686,28 @@ def build_home_page():
                 ).classes("btn-primary px-6").bind_enabled_from(form_state, "generating", lambda v: not v)
 
     # ── 流式生成 & 结果 ──
+    step_names = ["笔记整理", "知识图谱", "面试题生成", "质量审查", "补充练习题", "最终整合"]
+    step_icons = ["auto_stories", "hub", "quiz", "fact_check", "extension", "integration_instructions"]
+    step_descriptions = [
+        "智能整理和结构化笔记内容",
+        "构建知识点之间的关联图谱",
+        "基于笔记生成岗位相关面试题",
+        "审查题目质量确保专业准确",
+        "补充扩展追问和练习题",
+        "整合所有模块输出最终文档",
+    ]
+
+    generated_main_content = ui.markdown().set_content("").classes("hidden")
+
     with ui.card().classes("card-modern w-full max-w-5xl mx-auto p-6 fade-in").bind_visibility_from(
         form_state, "generating"
     ).style("transition: all 0.3s ease"):
         # 6 步进度指示器
-        step_names = ["笔记整理", "知识图谱", "面试题生成", "质量审查", "补充练习题", "最终整合"]
         with ui.row().classes("w-full gap-2 mb-4 items-center"):
             for i, name in enumerate(step_names):
-                is_active = form_state.current_step == i + 1
-                is_done = form_state.current_step > i + 1
+                idx = i + 1
+                is_active = form_state.current_step == idx
+                is_done = form_state.current_step > idx
                 if is_active:
                     icon_name, icon_color = "radio_button_checked", "text-primary"
                 elif is_done:
@@ -528,13 +719,37 @@ def build_home_page():
                     ui.label(name).classes("text-xs text-secondary" if not is_active else "text-xs font-semibold text-primary")
                 if i < 5:
                     ui.icon("arrow_forward", size="12px").classes("text-muted")
+
         # spinner + 当前状态
         with ui.row().classes("w-full items-center gap-3 mb-4"):
             ui.spinner(size="24px").classes("text-primary")
             ui.label().bind_text_from(form_state, "step_label").classes("text-lg font-bold")
 
-        # 流式内容区域
-        streaming_md = ui.markdown().bind_content_from(form_state, "streaming_content").classes("markdown-content")
+        # ══ 6 个独立步骤卡片 ══
+        for i, name in enumerate(step_names):
+            idx = i + 1
+            # 该步骤是否已到达 (current_step >= idx)
+            visible = f"form_state.current_step >= {idx}"
+            with ui.card().classes("step-card w-full").bind_visibility_from(
+                form_state, "current_step", lambda v, idx=idx: v >= idx
+            ):
+                # 头部：状态图标 + 步骤名 + 状态标签
+                with ui.row().classes("w-full items-center gap-3 mb-2"):
+                    # 状态图标（动态绑定）
+                    status_icon = ui.icon("radio_button_unchecked", size="22px").classes("text-muted")
+                    _stream_status_icons[idx] = status_icon
+                    ui.label(f"步骤 {idx}").classes("text-xs font-mono text-muted mr-1")
+                    ui.label(name).classes("text-base font-bold")
+                    # 状态 badge（动态绑定）
+                    status_badge = ui.badge("").props("outline").classes("text-xs ml-auto")
+                    _stream_status_labels[idx] = status_badge
+
+                # 步骤描述（仅生成中显示）
+                ui.label(step_descriptions[i]).classes("text-xs text-muted mb-2")
+
+                # 滚动内容区 — 每步独立 markdown
+                step_md = ui.markdown().classes("markdown-content step-content-scroll w-full")
+                _stream_step_mds[idx] = step_md
 
     # ── 完成后的操作区域 ──
     with ui.card().classes("card-modern w-full max-w-5xl mx-auto p-6 fade-in").bind_visibility_from(
@@ -549,8 +764,21 @@ def build_home_page():
                 "px-3 py-1 rounded-full bg-primary/10 text-primary font-semibold text-sm"
             )
 
+        # ══ 完成后的 6 个可折叠模块（独立展开，互不影响） ══
+        for i, name in enumerate(step_names):
+            idx = i + 1
+            exp = ui.expansion(text=f"  {name}", icon=step_icons[i]).classes("w-full border rounded-lg mb-2")
+            _result_expansions[idx] = exp
+            with exp:
+                # 步骤状态 & 内容（无高度限制，完整显示）
+                with ui.row().classes("w-full items-center gap-2 mb-2"):
+                    status_label = ui.label("").classes("text-xs font-semibold")
+                _result_status_labels[idx] = status_label
+                done_step_md = ui.markdown().classes("markdown-content step-result-scroll w-full")
+                _result_step_mds[idx] = done_step_md
+
         # 操作按钮
-        with ui.row().classes("w-full gap-2 mb-4 flex-wrap"):
+        with ui.row().classes("w-full gap-2 mt-4 flex-wrap"):
             ui.button("去题库自测", icon="quiz", color="primary").on(
                 "click", lambda: ui.notify("请切换到「题库」Tab 开始自测", type="info")
             ).classes("btn-primary")
@@ -565,7 +793,49 @@ def build_home_page():
 
 def build_history_page():
     """构建历史记录页面"""
+    global history_container_ref, search_input_ref, position_filter_ref  # noqa: B006
+    global view_dialog_ref, view_title_label_ref, view_content_area_ref  # noqa: B006
+    global delete_dialog_ref, delete_msg_label_ref, delete_detail_label_ref  # noqa: B006
+
     ui.space().classes("h-6")
+
+    # 删除确认对话框（页面级别，避免被渲染刷新清除）
+    with ui.dialog().classes("delete-dialog") as delete_dialog:
+        delete_dialog_ref = delete_dialog
+        with ui.card().style("min-width: 380px; overflow: hidden"):
+            ui.html("<div class='delete-dialog-top-bar'></div>")
+            with ui.column().classes("items-center gap-2 px-8 py-6"):
+                ui.html(
+                    "<div class='delete-dialog-icon'>"
+                    "<svg xmlns='http://www.w3.org/2000/svg' width='26' height='26' fill='none' viewBox='0 0 24 24'>"
+                    "<path d='M12 9v3.5M12 15.5h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z' "
+                    "stroke='#dc2626' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/>"
+                    "</svg></div>"
+                )
+                ui.label("确认删除").classes("text-lg font-bold")
+                delete_msg_label_ref = ui.label("").classes("text-center text-sm")
+                delete_detail_label_ref = ui.label("").classes("delete-dialog-detail")
+                ui.label("此操作不可撤销。").classes("text-xs text-muted mt-1")
+            with ui.row().classes("w-full gap-3 px-8 pb-6 justify-end"):
+                def _handle_delete():
+                    """处理删除确认"""
+                    if delete_note_ref["note"] is not None:
+                        _do_delete(delete_note_ref["note"].id)
+                        delete_dialog_ref.close()
+                ui.button("取消", on_click=delete_dialog_ref.close).classes("delete-dialog-cancel")
+                ui.button("确认删除", icon="delete", on_click=_handle_delete).classes("delete-dialog-confirm")
+
+    # 查看历史对话框（页面级别，避免被渲染刷新清除）
+    with ui.dialog().classes("dialog-modern dialog-wide") as view_dialog:
+        view_dialog_ref = view_dialog
+        with ui.card().classes("w-full p-6 flex flex-col").style("height: 80vh"):
+            with ui.row().classes("w-full justify-between items-center mb-4"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.icon("description", size="24px").classes("text-primary")
+                    view_title_label_ref = ui.label("").classes("text-xl font-bold")
+                ui.button("关闭", icon="close").props("flat").classes("btn-ghost").on("click", view_dialog_ref.close)
+            ui.html("<hr class='divider-gradient' />")
+            view_content_area_ref = ui.scroll_area().classes("flex-1 min-h-0")
 
     with ui.card().classes("card-modern w-full max-w-5xl mx-auto p-6 fade-in"):
         with ui.row().classes("w-full justify-between items-center mb-5"):
@@ -576,77 +846,21 @@ def build_history_page():
 
         # 搜索 + 筛选
         with ui.row().classes("w-full gap-3 mb-4 items-center"):
-            search_input = ui.input(label="搜索岗位", placeholder="输入岗位名称...").classes("flex-1").props("outlined dense clearable")
+            search_input_ref = ui.input(label="搜索岗位", placeholder="输入岗位名称...").classes("flex-1").props("outlined dense clearable")
             all_positions = list(dict.fromkeys(n.job_position for n in get_notes_cached()))
-            position_filter = ui.select(
+            position_filter_ref = ui.select(
                 options=["全部"] + all_positions,
                 value="全部",
                 label="岗位筛选",
             ).classes("w-48").props("outlined dense")
 
         # 历史列表容器
-        history_container = ui.column().classes("w-full gap-3")
-
-        def render_history():
-            history_container.clear()
-            with history_container:
-                notes = get_notes_cached(limit=50)
-
-                # 应用筛选
-                keyword = (search_input.value or "").strip()
-                pos = position_filter.value
-                if keyword:
-                    notes = [n for n in notes if keyword.lower() in n.job_position.lower()]
-                if pos and pos != "全部":
-                    notes = [n for n in notes if n.job_position == pos]
-
-                if not notes:
-                    with ui.column().classes("empty-state"):
-                        ui.icon("menu_book", size="56px").classes("opacity-30")
-                        ui.label("暂无历史记录").classes("text-lg font-medium mt-2")
-                        if keyword or (pos and pos != "全部"):
-                            ui.label("没有匹配的记录，试试别的关键词").classes("text-sm text-muted mt-1")
-                        else:
-                            ui.label("先生成一份面试题吧！").classes("text-sm text-muted mt-1")
-                    return
-
-                for note in notes:
-                    status_style = {
-                        "done": ("badge-done", "✅", "已完成"),
-                        "failed": ("badge-failed", "❌", "失败"),
-                        "processing": ("badge-processing", "⏳", "处理中"),
-                        "pending": ("badge-pending", "⏳", "排队中"),
-                    }.get(note.status, ("badge-pending", "❓", "未知"))
-                    badge_cls, icon, status_text = status_style
-
-                    with ui.card().classes("history-card w-full p-4"):
-                        with ui.row().classes("w-full justify-between items-center"):
-                            with ui.column().classes("gap-1.5"):
-                                with ui.row().classes("items-center gap-2"):
-                                    ui.label(f"{icon} {note.date}").classes("text-base font-bold")
-                                    ui.html(f"<span class='badge {badge_cls}'>{status_text}</span>")
-                                with ui.row().classes("items-center gap-3"):
-                                    ui.label(f"💼 {note.job_position}").classes(
-                                        "text-sm px-2 py-0.5 rounded-md bg-primary/5 text-primary"
-                                    )
-                                    ui.label(f"📄 {len(note.raw_notes)} 字").classes("text-sm text-muted")
-                                    if hasattr(note, 'questions') and note.questions:
-                                        q = note.questions[0]
-                                        ui.label(f"📝 {q.question_count} 题").classes("text-sm text-muted")
-
-                            with ui.row().classes("gap-2"):
-                                if note.status == "done":
-                                    ui.button("查看", icon="visibility", color="primary").props(
-                                        "dense flat"
-                                    ).classes("btn-ghost text-primary").on("click", lambda n=note: _view_history(n))
-                                ui.button("删除", icon="delete", color="negative").props(
-                                    "dense flat"
-                                ).classes("btn-ghost text-negative").on("click", lambda n=note: _confirm_delete(n))
+        history_container_ref = ui.column().classes("w-full gap-3")
 
         # 筛选变化时重新渲染
-        search_input.on("update:model-value", lambda e: render_history())
-        position_filter.on("update:model-value", lambda e: render_history())
-        render_history()
+        search_input_ref.on("update:model-value", lambda e: _render_history_module())
+        position_filter_ref.on("update:model-value", lambda e: _render_history_module())
+        _render_history_module()
 
 
 KG_PAGE_CSS = """
@@ -676,10 +890,12 @@ class KgState:
         self.gen_start_time: float = 0  # 生成开始时间
         self.gen_elapsed: int = 0  # 已耗时秒数
         self.gen_error: str = ""  # 生成错误信息
+        self._lock = threading.Lock()
 
 
 kg_state = KgState()
 kg_content_area = None  # ui.refreshable placeholder
+kg_select_ref = None  # 知识图谱页面笔记下拉选择器
 
 
 def _load_kg_notes():
@@ -700,12 +916,13 @@ def _generate_kg_for_note(note_id: int):
     """为已有笔记生成知识图谱（后台线程）"""
     import time
     note = get_note_by_id(note_id)
-    if not note or kg_state.generating:
-        return
-    kg_state.generating = True
-    kg_state.gen_start_time = time.time()
-    kg_state.gen_elapsed = 0
-    kg_state.gen_error = ""
+    with kg_state._lock:
+        if kg_state.generating:
+            return
+        kg_state.generating = True
+        kg_state.gen_start_time = time.time()
+        kg_state.gen_elapsed = 0
+        kg_state.gen_error = ""
 
     def _do_generate():
         try:
@@ -729,10 +946,11 @@ def _generate_kg_for_note(note_id: int):
 
     def _run():
         result = _do_generate()
-        kg_state.generating = False
-        kg_state.gen_elapsed = int(time.time() - kg_state.gen_start_time)
-        if result is not True:
-            kg_state.gen_error = str(result)
+        with kg_state._lock:
+            kg_state.generating = False
+            kg_state.gen_elapsed = int(time.time() - kg_state.gen_start_time)
+            if result is not True:
+                kg_state.gen_error = str(result)
 
     import threading
     threading.Thread(target=_run, daemon=True).start()
@@ -841,14 +1059,10 @@ def _build_echart_option() -> dict:
     }
 
 
-def build_knowledge_graph_page():
-    """构建知识图谱页面"""
-    ui.add_head_html(f"<style>{KG_PAGE_CSS}</style>")
-    ui.space().classes("h-6")
-
+def _build_kg_select():
+    """构建知识图谱选择器（内部辅助）"""
     _load_kg_notes()
 
-    # ── 顶部：选择笔记 ──
     with ui.card().classes("card-modern w-full max-w-6xl mx-auto p-6 fade-in"):
         with ui.row().classes("w-full items-center gap-3 mb-4"):
             ui.icon("hub", size="28px").classes("text-primary")
@@ -872,7 +1086,26 @@ def build_knowledge_graph_page():
                 _on_kg_note_select(kg_note_options[first_label])
         else:
             ui.label("还没有已生成的面试题，请先到首页生成").classes("text-secondary")
-            return
+
+
+@ui.refreshable
+def kg_select_area():
+    """知识图谱页面选择器（可刷新）"""
+    _build_kg_select()
+
+
+def _refresh_kg_select():
+    """刷新知识图谱页面选择器"""
+    invalidate_notes_cache()
+    kg_select_area.refresh()
+
+
+def build_knowledge_graph_page():
+    """构建知识图谱页面"""
+    ui.add_head_html(f"<style>{KG_PAGE_CSS}</style>")
+    ui.space().classes("h-6")
+
+    kg_select_area()
 
     # ── 内容区域（可刷新） ──
     @ui.refreshable
@@ -1020,19 +1253,35 @@ def build_knowledge_graph_page():
     kg_content_area = kg_content
     kg_content()
 
-    # 轮询：生成中每秒刷新计时，完成后加载图谱数据并刷新
+    # 轮询：生成中每秒刷新，完成后自动加载
+    _kg_poll_active = [True]
     was_generating = [kg_state.generating]
 
-    def _check_gen_done():
-        if was_generating[0] and not kg_state.generating:
-            was_generating[0] = False
-            _on_kg_note_select(kg_state.current_note_id)  # 从数据库加载刚生成的图谱
+    def _kg_poll_cb():
+        """KG 页面轮询回调（运行时自动捕获异常）"""
+        nonlocal was_generating
+        if not _kg_poll_active[0]:
             return
-        elif kg_state.generating:
-            kg_content_area.refresh()  # 每秒刷新计时
-        was_generating[0] = kg_state.generating
+        try:
+            with kg_state._lock:
+                generating = kg_state.generating
+            if was_generating[0] and not generating:
+                was_generating[0] = False
+                _on_kg_note_select(kg_state.current_note_id)
+                return
+            elif generating:
+                kg_content_area.refresh()
+            was_generating[0] = generating
+        except RuntimeError as e:
+            if "parent slot" in str(e).lower():
+                _kg_poll_active[0] = False
+                return
+            raise
+        except Exception:
+            pass  # 页面切换间隙静默忽略
 
-    ui.timer(1.0, _check_gen_done, once=False)
+    with _TIMER_ROOT:
+        _kg_timer = ui.timer(1.0, _kg_poll_cb, once=False)
 
 
 # ══════════════════════════════════════════════════
@@ -1055,6 +1304,9 @@ class QuizState:
 
 quiz_state = QuizState()
 quiz_content_area = None  # ui.refreshable placeholder
+quiz_select_ref = None  # 题库页面笔记下拉选择器
+quiz_select_placeholder = None  # 选择器所在容器（可清除重建）
+quiz_empty_label = None  # "无面试题" 提示标签
 
 
 def _load_quiz_notes():
@@ -1219,14 +1471,10 @@ def auto_scan_import():
         logger.info("自动扫描完成，共导入 %d 个面试题文件", imported)
 
 
-def build_quiz_page():
-    """构建题库自测页面"""
-    global quiz_content_area
-    ui.space().classes("h-6")
-
+def _build_quiz_select():
+    """构建题库选择器（内部辅助）"""
     _load_quiz_notes()
 
-    # ── 顶部：选择笔记 ──
     with ui.card().classes("card-modern w-full max-w-6xl mx-auto p-6 fade-in"):
         with ui.row().classes("w-full items-center justify-between mb-4"):
             with ui.row().classes("items-center gap-3"):
@@ -1254,7 +1502,26 @@ def build_quiz_page():
                 _on_quiz_note_select(note_options[first_label])
         else:
             ui.label("还没有已生成的面试题，请先到首页生成").classes("text-secondary")
-            return
+
+
+@ui.refreshable
+def quiz_select_area():
+    """题库页面选择器（可刷新）"""
+    _build_quiz_select()
+
+
+def _refresh_quiz_select():
+    """刷新题库页面选择器"""
+    invalidate_notes_cache()
+    quiz_select_area.refresh()
+
+
+def build_quiz_page():
+    """构建题库自测页面"""
+    global quiz_content_area
+    ui.space().classes("h-6")
+
+    quiz_select_area()
 
     # ── 题目内容区域（可刷新） ──
     @ui.refreshable
@@ -1373,9 +1640,14 @@ def build_quiz_page():
                     with ui.row().classes("items-center gap-3"):
                         ui.badge(f"Q{q['num']}", color="primary").classes("text-sm")
                         if q["difficulty"]:
-                            diff_color = {"高": "red", "中": "orange", "低": "green"}.get(q["difficulty"][0] if q["difficulty"] else "", "primary")
+                            _diff_cls_map = {
+                                "高": "bg-red-500/10 text-red-500",
+                                "中": "bg-orange-500/10 text-orange-500",
+                                "低": "bg-green-500/10 text-green-500",
+                            }
+                            _diff_key = q["difficulty"][0] if q["difficulty"] else ""
                             ui.label(q["difficulty"]).classes(
-                                f"text-xs px-2 py-0.5 rounded-full bg-{diff_color}/10 text-{diff_color}"
+                                f"text-xs px-2 py-0.5 rounded-full {_diff_cls_map.get(_diff_key, 'bg-primary/10 text-primary')}"
                             )
                         if q["category"]:
                             ui.label(q["category"]).classes("text-xs px-2 py-0.5 rounded-full bg-surface-alt border border-border")
@@ -1436,8 +1708,7 @@ def build_quiz_page():
                             "click", _quiz_next
                         ).props("flat")
 
-                # 键盘快捷键
-                ui.keyboard(on_key=lambda e: _on_quiz_key(e))
+
 
         # ── 完成总结 ──
         all_tested = all(q["index"] in quiz_state.records for q in qs)
@@ -1478,6 +1749,9 @@ def build_quiz_page():
     quiz_content_area = quiz_content
     quiz_content()
 
+    # 键盘快捷键 — 放在 refreshable 外部，避免每次刷新重复绑定
+    ui.keyboard(on_key=lambda e: _on_quiz_key(e))
+
 
 def _on_quiz_key(e):
     """题库页面键盘快捷键"""
@@ -1513,8 +1787,11 @@ class FormState:
         self.debug_url_label = ""
         self.show_custom_job = False
         # 流式生成相关
-        self.streaming_content = ""  # 流式累积内容
+        self.streaming_content = ""  # 流式累积内容 (全部)
+        self.step_contents: dict = {}  # {step_idx: "content"} 每步独立内容
+        self.step_status: dict = {}  # {step_idx: "pending"|"running"|"done"|"failed"}
         self.current_step = 0  # 当前步骤 0-6
+        self.step_error: dict = {}  # {step_idx: "error msg"} 某步失败信息
         self.step_label = ""  # 当前步骤名称
         self.question_count_label = ""  # 题目数量标签
 
@@ -1538,7 +1815,17 @@ def _clear_form():
     form_state.show_result = False
     form_state.generating = False
     form_state.streaming_content = ""
+    form_state.step_contents = {}
+    form_state.step_status = {}
+    form_state.step_error = {}
     form_state.current_step = 0
+
+    # 重置结果状态标签
+    for lb in _result_status_labels.values():
+        try:
+            lb.set_text("")
+        except Exception:
+            pass
 
 
 def _start_generate():
@@ -1558,10 +1845,27 @@ def _start_generate():
     form_state.show_result = False
     form_state.result_content = ""
     form_state.streaming_content = ""
+    form_state.step_contents = {}
+    form_state.step_status = {}
+    form_state.step_error = {}
     form_state.current_step = 0
     form_state.step_label = "准备中..."
 
-    ui.notify("🚀 任务已提交，正在生成面试题...", type="ongoing", position="top")
+    global CURRENT_TASK_ID, CURRENT_TIMER, GEN_NOTIFY
+
+    # 替换旧的进度通知（可被 dismiss）
+    if GEN_NOTIFY:
+        try:
+            GEN_NOTIFY.dismiss()
+        except Exception:
+            pass
+    GEN_NOTIFY = ui.notification(
+        "🚀 任务已提交，正在生成面试题...",
+        type="info",
+        spinner=True,
+        timeout=0,
+        position="top",
+    )
 
     # 启动后台任务
     global CURRENT_TASK_ID, CURRENT_TIMER
@@ -1579,7 +1883,24 @@ def _start_generate():
             CURRENT_TIMER.deactivate()
         except Exception:
             pass
-    CURRENT_TIMER = ui.timer(0.3, _poll_task, once=False)
+    with _TIMER_ROOT:
+        CURRENT_TIMER = ui.timer(0.3, _safe_poll_task, once=False)
+
+
+def _safe_poll_task():
+    """安全包装 _poll_task，防止页面 slot 被删除时崩溃"""
+    try:
+        if not _poll_task():
+            # _poll_task 返回 False → 停止轮询
+            _stop_timer()
+    except RuntimeError as e:
+        if "parent slot" in str(e).lower():
+            _stop_timer()
+            return
+        raise
+    except Exception:
+        _stop_timer()
+        raise
 
 
 def _on_task_update(task_dict: dict):
@@ -1597,13 +1918,64 @@ def _poll_task():
     if not task:
         return
 
-    # 实时同步流式内容
+    # 实时同步流式内容 + 每步独立内容 + 步骤状态
     form_state.streaming_content = task.streaming_content
+    form_state.step_contents = dict(task.step_contents)
+    form_state.step_status = dict(task.step_status)
     form_state.current_step = task.current_step
     form_state.step_label = task.progress_msg
 
+    # 更新每步独立内容的显示
+    for step_idx, content in (task.step_contents or {}).items():
+        # 更新流式卡片内容
+        if step_idx in _stream_step_mds:
+            _stream_step_mds[step_idx].set_content(content or "（等待生成...）")
+
+        # 更新结果卡片内容（任务完成或部分完成时）
+        if step_idx in _result_step_mds:
+            _result_step_mds[step_idx].set_content(content or "（该步骤无可用内容）")
+
+        # 更新状态图标和标签
+        st = task.step_status.get(step_idx, "pending")
+        if st == "done":
+            if step_idx in _stream_status_icons:
+                _stream_status_icons[step_idx].name = "check_circle"
+                _stream_status_icons[step_idx].classes("text-green-500")
+            if step_idx in _stream_status_labels:
+                _stream_status_labels[step_idx].set_text("✅ 完成")
+                _stream_status_labels[step_idx].classes("badge-done")
+            if step_idx in _result_status_labels:
+                _result_status_labels[step_idx].set_text("✅ 完成")
+                _result_status_labels[step_idx].classes("text-green-500 font-semibold")
+            if step_idx in _result_expansions:
+                _result_expansions[step_idx].classes("step-expansion-done")
+        elif st == "failed":
+            if step_idx in _stream_status_icons:
+                _stream_status_icons[step_idx].name = "error"
+                _stream_status_icons[step_idx].classes("text-red-500")
+            if step_idx in _stream_status_labels:
+                _stream_status_labels[step_idx].set_text("❌ 失败")
+                _stream_status_labels[step_idx].classes("badge-failed")
+            if step_idx in _result_status_labels:
+                _result_status_labels[step_idx].set_text("❌ 失败（跳过）")
+                _result_status_labels[step_idx].classes("text-red-500 font-semibold")
+        elif st == "running":
+            if step_idx in _stream_status_icons:
+                _stream_status_icons[step_idx].name = "radio_button_checked"
+                _stream_status_icons[step_idx].classes("text-primary")
+            if step_idx in _stream_status_labels:
+                _stream_status_labels[step_idx].set_text("⏳ 生成中...")
+                _stream_status_labels[step_idx].classes("badge-processing")
+
     if task.status.value == "done":
         # 生成完成 — 保留流式卡片内容，显示操作按钮
+        global GEN_NOTIFY
+        if GEN_NOTIFY:
+            try:
+                GEN_NOTIFY.dismiss()
+            except Exception:
+                pass
+            GEN_NOTIFY = None
         form_state.generating = False
         form_state.show_result = True
         form_state.result_content = task.result
@@ -1617,10 +1989,19 @@ def _poll_task():
             position="top",
         )
         _stop_timer()
+        # 生成完成后刷新题库和知识图谱页面
+        _refresh_quiz_select()
+        _refresh_kg_select()
         return False
 
     elif task.status.value == "failed":
         # 失败 — 保留已生成的内容，显示错误提示
+        if GEN_NOTIFY:
+            try:
+                GEN_NOTIFY.dismiss()
+            except Exception:
+                pass
+            GEN_NOTIFY = None
         form_state.generating = False
         form_state.show_result = True
         form_state.result_content = task.streaming_content  # 保留部分结果
@@ -1634,14 +2015,20 @@ def _poll_task():
 
 
 def _stop_timer():
-    """停止当前轮询定时器"""
-    global CURRENT_TIMER
+    """停止当前轮询定时器，并清除通知"""
+    global CURRENT_TIMER, GEN_NOTIFY
     if CURRENT_TIMER:
         try:
             CURRENT_TIMER.deactivate()
         except Exception:
             pass
         CURRENT_TIMER = None
+    if GEN_NOTIFY:
+        try:
+            GEN_NOTIFY.dismiss()
+        except Exception:
+            pass
+        GEN_NOTIFY = None
 
 
 def _copy_result():
@@ -1652,11 +2039,28 @@ def _copy_result():
 
 
 def _export_markdown():
-    """导出为 Markdown 文件"""
-    if not form_state.result_content:
+    """导出为 Markdown 文件 — 使用各步骤独立内容组装，支持部分失败导出"""
+    step_names = ["笔记整理", "知识图谱", "面试题生成", "质量审查", "补充练习题", "最终整合"]
+    content_parts = []
+
+    # 优先使用各步骤独立内容（每步成功/失败状态独立，支持部分失败导出）
+    if form_state.step_contents:
+        for idx in sorted(form_state.step_contents.keys(), key=int):
+            step_content = form_state.step_contents[idx]
+            if step_content:
+                idx_int = int(idx)
+                label = step_names[idx_int - 1] if 1 <= idx_int <= 6 else f"步骤{idx}"
+                st = form_state.step_status.get(idx_int, "")
+                status_label = " ✅ 已完成" if st == "done" else (" ❌ 失败" if st == "failed" else "")
+                header = f"# {label}{status_label}\n\n"
+                content_parts.append(header + step_content)
+    elif form_state.result_content:
+        content_parts.append(form_state.result_content)
+    else:
+        ui.notify("❌ 没有可导出的内容", type="negative", position="top")
         return
 
-    content = form_state.result_content
+    content = "\n\n---\n\n".join(content_parts)
     filename = f"面试题_{form_state.date}_{form_state.job_position}.md"
     # 清理文件名中的非法字符
     filename = "".join(c if c.isalnum() or c in "._- " else "_" for c in filename)
@@ -1678,41 +2082,159 @@ def _regenerate():
 def _refresh_history():
     """刷新历史记录（手动刷新 → 绕过缓存）"""
     invalidate_notes_cache()
+    _stop_timer()
     ui.navigate.reload()
 
 
-def _view_history(note):
-    """查看历史记录详情"""
-    questions = get_questions_by_note_id(note.id)
-    if not questions:
-        ui.notify("该记录暂无面试题数据", type="warning", position="top")
+
+def _render_history_module():
+    """模块级历史记录渲染（供删除回调等外部调用）"""
+    if history_container_ref is None:
         return
+    history_container_ref.clear()
+    with history_container_ref:
+        notes = get_notes_cached(limit=50)
 
-    with ui.dialog().classes("dialog-modern w-full max-w-4xl") as dialog, ui.card().classes("w-full p-6"):
-        with ui.row().classes("w-full justify-between items-center mb-4"):
-            with ui.row().classes("items-center gap-2"):
-                ui.icon("description", size="24px").classes("text-primary")
-                ui.label(f"{note.date} | {note.job_position}").classes("text-xl font-bold")
-            ui.button("关闭", icon="close").props("flat").classes("btn-ghost").on("click", dialog.close)
-        ui.html("<hr class='divider-gradient' />")
-        ui.markdown(questions.content).classes("markdown-content")
-    dialog.open()
+        # 动态更新岗位筛选选项
+        if position_filter_ref is not None:
+            new_positions = list(dict.fromkeys(n.job_position for n in notes))
+            current_pos = position_filter_ref.value
+            position_filter_ref.set_options(["全部"] + new_positions)
+            if current_pos in (["全部"] + new_positions):
+                position_filter_ref.value = current_pos
+
+        # 应用筛选
+        keyword = ""
+        pos = "全部"
+        if search_input_ref is not None:
+            keyword = (search_input_ref.value or "").strip()
+        if position_filter_ref is not None:
+            pos = position_filter_ref.value
+        if keyword:
+            notes = [n for n in notes if keyword.lower() in n.job_position.lower()]
+        if pos and pos != "全部":
+            notes = [n for n in notes if n.job_position == pos]
+
+        if not notes:
+            with ui.column().classes("empty-state"):
+                ui.icon("menu_book", size="56px").classes("opacity-30")
+                ui.label("暂无历史记录").classes("text-lg font-medium mt-2")
+                if keyword or (pos and pos != "全部"):
+                    ui.label("没有匹配的记录，试试别的关键词").classes("text-sm text-muted mt-1")
+                else:
+                    ui.label("先生成一份面试题吧！").classes("text-sm text-muted mt-1")
+            return
+
+        for note in notes:
+            status_style = {
+                "done": ("badge-done", "✅", "已完成"),
+                "failed": ("badge-failed", "❌", "失败"),
+                "processing": ("badge-processing", "⏳", "处理中"),
+                "pending": ("badge-pending", "⏳", "排队中"),
+            }.get(note.status, ("badge-pending", "❓", "未知"))
+            badge_cls, icon, status_text = status_style
+
+            with ui.card().classes("history-card w-full p-4"):
+                with ui.row().classes("w-full justify-between items-center"):
+                    with ui.column().classes("gap-1.5"):
+                        with ui.row().classes("items-center gap-2"):
+                            ui.label(f"{icon} {note.date}").classes("text-base font-bold")
+                            ui.html(f"<span class='badge {badge_cls}'>{status_text}</span>")
+                        with ui.row().classes("items-center gap-3"):
+                            ui.label(f"💼 {note.job_position}").classes(
+                                "text-sm px-2 py-0.5 rounded-md bg-primary/5 text-primary"
+                            )
+                            ui.label(f"📄 {len(note.raw_notes)} 字").classes("text-sm text-muted")
+                            if hasattr(note, 'questions') and note.questions:
+                                q = note.questions[0]
+                                ui.label(f"📝 {q.question_count} 题").classes("text-sm text-muted")
+
+                    with ui.row().classes("gap-2"):
+                        # 查看按钮：所有状态均可查看（处理中/排队中显示部分内容）
+                        ui.button("查看", icon="visibility", color="primary").props(
+                            "dense flat"
+                        ).classes("btn-ghost text-primary").on("click", lambda n=note: _show_view_history(n))
+                        # 重新生成按钮：仅失败记录可见
+                        if note.status == "failed":
+                            ui.button("重新生成", icon="refresh", color="negative").props(
+                                "dense flat"
+                            ).classes("btn-ghost text-negative").on("click", lambda n=note: _regenerate_from_note(n))
+                        ui.button(icon="delete_outline").props(
+                            "dense flat rounded"
+                        ).classes("btn-delete-icon").on("click", lambda n=note: _show_delete_confirm(n))
 
 
-def _confirm_delete(note):
-    """确认删除"""
-    with ui.dialog().classes("dialog-modern") as dialog, ui.card().classes("p-6"):
-        with ui.column().classes("items-center gap-3"):
-            ui.icon("warning_amber", size="40px").classes("text-negative")
-            ui.label("确认删除").classes("text-lg font-bold")
-            ui.label(f"确定要删除 {note.date} 的记录吗？").classes("")
-            ui.label("此操作不可撤销。").classes("text-sm text-muted")
-        with ui.row().classes("gap-4 mt-4 justify-center"):
-            ui.button("取消", on_click=dialog.close).classes("btn-ghost")
-            ui.button("确认删除", color="negative", icon="delete").on(
-                "click", lambda: (_do_delete(note.id), dialog.close())
-            ).classes("btn-primary !bg-red-500 !shadow-red-500/30")
-    dialog.open()
+history_container_ref = None
+search_input_ref = None
+position_filter_ref = None
+view_dialog_ref = None
+view_title_label_ref = None
+view_content_area_ref = None
+delete_dialog_ref = None
+delete_note_ref: dict = {"note": None}
+delete_msg_label_ref = None
+delete_detail_label_ref = None
+
+
+def _show_delete_confirm(note):
+    """显示删除确认对话框"""
+    if delete_dialog_ref is None:
+        return
+    delete_note_ref["note"] = note
+    delete_msg_label_ref.text = "确定要删除以下记录吗？"
+    delete_detail_label_ref.text = f"📅 {note.date} | 💼 {note.job_position}"
+    delete_dialog_ref.open()
+
+
+def _regenerate_from_note(note):
+    """从历史记录重新生成"""
+    # 填充表单
+    form_state.notes = note.raw_notes
+    form_state.job_position = note.job_position
+    form_state.date = note.date
+    # 切换到首页 tab 开始生成
+    _start_generate()
+    global _NAV_TABS
+    if _NAV_TABS is not None:
+        _NAV_TABS.set_value("首页")
+
+
+def _show_view_history(note):
+    """显示查看历史对话框"""
+    if view_dialog_ref is None:
+        return
+    questions = get_questions_by_note_id(note.id)
+    view_title_label_ref.text = f"{note.date} | {note.job_position}"
+    view_content_area_ref.clear()
+    with view_content_area_ref:
+        # 生成中的记录提示
+        if note.status in ("pending", "processing"):
+            ui.html(
+                '<div class="p-3 mb-4 rounded-lg bg-blue-50 dark:bg-blue-900/20 '
+                'border border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-300 '
+                'text-sm">'
+                '<strong>⏳ 该记录仍在生成中，</strong>请稍后刷新查看'
+                '</div>'
+            )
+        # 失败记录显示错误提示
+        if note.status == "failed" and note.error_msg:
+            ui.html(
+                f'<div class="p-3 mb-4 rounded-lg bg-red-50 dark:bg-red-900/20 '
+                f'border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 '
+                f'text-sm">'
+                f'<strong>⚠️ 生成失败：</strong>{note.error_msg}'
+                f'</div>'
+            )
+        if questions:
+            ui.markdown(questions.content).classes("markdown-content")
+        else:
+            if note.status == "failed":
+                ui.label("该记录生成过程中失败，无面试题数据").classes("text-muted mt-4")
+            elif note.status in ("pending", "processing"):
+                ui.label("该记录仍在生成中，暂无面试题数据").classes("text-muted mt-4")
+            else:
+                ui.notify("该记录暂无面试题数据", type="warning", position="top")
+    view_dialog_ref.open()
 
 
 def _do_delete(note_id: int):
@@ -1720,9 +2242,11 @@ def _do_delete(note_id: int):
     try:
         delete_note(note_id)
         ui.notify("🗑️ 已删除", type="positive", position="top")
-        _refresh_history()
     except Exception as e:
         ui.notify(f"删除失败: {e}", type="negative", position="top")
+    finally:
+        invalidate_notes_cache()
+        _render_history_module()
 
 
 # ══════════════════════════════════════════════════
@@ -1733,17 +2257,24 @@ def _do_delete(note_id: int):
 def main_page():
     """主页面"""
 
-    # 注入全局 CSS
-    inject_global_styles()
+    global _TIMER_ROOT, _NAV_TABS
+
+    # 在 tab_panels 外层创建隐藏容器 — 所有定时器的父 slot，永不删除
+    _TIMER_ROOT = ui.element("div").classes("hidden")
 
     # 初始化 question_count_label
     form_state.question_count_label = ""
 
-    # 导航
+    # 导航 — 从 storage 恢复上次活动 tab
+    active_tab = app.storage.user.get("active_tab", "首页")
     tabs = create_nav_tabs()
+    _NAV_TABS = tabs
+
+    # tab 切换时保存到 storage
+    tabs.on_value_change(lambda e: app.storage.user.update({"active_tab": e.value}))
 
     # 页面内容（根据 tab 切换）
-    with ui.tab_panels(tabs, value="首页").classes("w-full"):
+    with ui.tab_panels(tabs, value=active_tab).classes("w-full"):
         with ui.tab_panel("首页"):
             build_home_page()
 
@@ -1779,4 +2310,5 @@ if __name__ in {"__main__", "__mp_main__"}:
         language=settings.APP_LANGUAGE,
         favicon="📚",
         show=False,
+        storage_secret=settings.STORAGE_SECRET,
     )

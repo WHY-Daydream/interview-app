@@ -46,5 +46,8 @@ class Settings:
     # ── 任务超时 ──
     TASK_TIMEOUT: int = int(os.getenv("TASK_TIMEOUT", "300"))
 
+    # ── 会话存储密钥（用于 app.storage.user 持久化） ──
+    STORAGE_SECRET: str = os.getenv("STORAGE_SECRET", "interview-quiz-app-secret-key-change-me")
+
 
 settings = Settings()

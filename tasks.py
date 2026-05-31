@@ -35,7 +35,9 @@ class GenerateTask:
     question_count: int = 0
     debug_url: str = ""
     execute_id: str = ""
-    streaming_content: str = ""  # 流式累积内容
+    streaming_content: str = ""  # 流式累积内容 (全部)
+    step_contents: dict = field(default_factory=dict)  # {step_idx: "content"} 每步独立内容
+    step_status: dict = field(default_factory=dict)  # {step_idx: "pending"|"running"|"done"|"failed"}
     current_step: int = 0  # 当前步骤 (1-6)
     created_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
@@ -151,15 +153,23 @@ def _run_task(note_id: str, date: str, raw_notes: str, job_position: str):
                     setattr(task, 'progress', int(15 + pct * 0.8)),
                     setattr(task, 'progress_msg', msg),
                 ),
-                on_stream=lambda content: setattr(task, 'streaming_content', content),
+                on_stream=lambda content, step_idx, step_content: (
+                    setattr(task, 'streaming_content', content),
+                    task.step_contents.__setitem__(step_idx, step_content),
+                ),
                 on_step=lambda idx, label: (
                     setattr(task, 'current_step', idx),
+                    setattr(task, 'step_status', dict(task.step_status) | {idx: "running"}),
                     setattr(task, 'progress_msg', f"步骤 {idx}/6: {label}"),
                 ),
             )
             output = result["output"]
             debug_url = ""
             execute_id = ""
+
+            # 同步步骤状态
+            pipeline_step_status = result.get("step_status", {})
+            task.step_status = dict(pipeline_step_status)
 
             # 保存知识图谱
             kg_data = result.get("knowledge_graph", "")
@@ -198,6 +208,17 @@ def _run_task(note_id: str, date: str, raw_notes: str, job_position: str):
 
     except Exception as e:
         logger.error("任务失败: note_id=%s, error=%s", note_id, str(e))
+        # 保存已生成的部分内容（即使失败也不丢数据）
+        partial_content = getattr(task, 'streaming_content', "") or ""
+        if partial_content:
+            try:
+                save_questions(
+                    note_id=int(note_id),
+                    content=partial_content,
+                    question_count=partial_content.count("**Q"),
+                )
+            except Exception:
+                pass
         task.status = TaskStatus.FAILED
         task.progress = 0
         task.progress_msg = "生成失败"

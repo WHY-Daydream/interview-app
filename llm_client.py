@@ -12,8 +12,8 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 # NVIDIA API 网关超时约 5 分钟，留余量
-API_TIMEOUT = 240  # 单次请求超时（秒）
-MAX_INPUT_CHARS = 30000  # 输入最大字符数，防止 504
+API_TIMEOUT = 300  # 单次请求超时（秒），与 TASK_TIMEOUT 一致
+MAX_INPUT_CHARS = 60000  # 输入最大字符数（步骤6整合时需容纳前5步全部输出）
 
 
 def _truncate(text: str, limit: int = MAX_INPUT_CHARS) -> str:
@@ -294,29 +294,34 @@ STREAM_THROTTLE = 0.5  # 流式 UI 更新最小间隔（秒）
 
 
 def _stream_chat(client: LLMClient, system: str, user: str,
-                 accumulated: list, on_stream: Optional[Callable],
-                 prev_len: int, **kwargs) -> str:
-    """流式调用单个步骤，实时推送内容（节流更新）"""
+                 accumulated: list, step_content: list, on_stream: Optional[Callable],
+                 prev_len: int, step_idx: int, **kwargs) -> str:
+    """流式调用单个步骤，实时推送内容（节流更新）
+
+    step_content[0] tracks just this step's content for per-step export.
+    on_stream 签名: fn(full_accumulated: str, step_idx: int, step_content: str)
+    """
     chunks = []
     last_update = 0.0
     for chunk in client.chat_stream(system=system, user=user, **kwargs):
         chunks.append(chunk)
         accumulated[0] += chunk
+        step_content[0] += chunk
         if on_stream:
             now = time.time()
             if now - last_update >= STREAM_THROTTLE:
-                on_stream(accumulated[0])
+                on_stream(accumulated[0], step_idx, step_content[0])
                 last_update = now
     # 最后一次更新确保内容完整
     if on_stream:
-        on_stream(accumulated[0])
+        on_stream(accumulated[0], step_idx, step_content[0])
     return "".join(chunks)
 
 
 def run_pipeline(client: LLMClient, raw_notes: str, position: str, date: str,
                  progress_callback=None, on_stream: Optional[Callable] = None,
                  on_step: Optional[Callable] = None) -> dict:
-    """完整的面试题生成流水线（支持流式 + 自动重试）
+    """完整的面试题生成流水线（支持流式 + 自动重试 + 单步容错）
 
     Args:
         client: LLM 客户端
@@ -324,123 +329,166 @@ def run_pipeline(client: LLMClient, raw_notes: str, position: str, date: str,
         position: 目标岗位
         date: 日期
         progress_callback: 进度回调 fn(percent, msg)
-        on_stream: 流式回调 fn(accumulated_content)
+        on_stream: 流式回调 fn(accumulated_content, step_idx, step_content)
         on_step: 步骤切换回调 fn(step_index, step_label)
 
     Returns:
-        {"output": str, "question_count": int}
+        {"output": str, "question_count": int, "step_contents": dict,
+         "step_status": dict[int, str], "step_errors": dict[int, str]}
     """
     MAX_RETRIES = 3
+    step_status: dict[int, str] = {}
+    step_errors: dict[int, str] = {}
 
     def _progress(pct, msg):
         if progress_callback:
             progress_callback(pct, msg)
 
     def _step(idx, label):
+        step_status[idx] = "running"
         if on_step:
             on_step(idx, label)
 
     accumulated = [""]
+    step_contents = [{}]  # {step_idx: "content"} — per-step content for separate display/export
     use_stream = on_stream is not None
 
     def _call(system, user, label, step_idx, **kwargs):
-        """调用单个步骤，失败自动重试，重试时从断点继续"""
+        """调用单个步骤，失败自动重试，重试时从断点继续。
+        返回 (content, success) 元组，失败时 content="" 但不会抛出异常。
+        """
         _step(step_idx, label)
         if not use_stream:
-            return client.chat(system=system, user=user, **kwargs)
+            try:
+                return client.chat(system=system, user=user, **kwargs), True
+            except Exception as e:
+                logger.error("步骤 '%s'(非流式) 失败: %s", label, e)
+                step_status[step_idx] = "failed"
+                step_errors[step_idx] = str(e)
+                return "", False
 
         # 流式模式
         header = f"\n\n---\n\n## {label}\n\n"
         save_len = len(accumulated[0])
         accumulated[0] += header
-        on_stream(accumulated[0])
+        step_contents[0][step_idx] = ""
+        on_stream(accumulated[0], step_idx, step_contents[0].get(step_idx, ""))
 
         for attempt in range(MAX_RETRIES):
             try:
-                return _stream_chat(
-                    client, system, user, accumulated, on_stream, save_len, **kwargs,
+                step_buf = [step_contents[0].get(step_idx, "")]
+                result = _stream_chat(
+                    client, system, user, accumulated, step_buf, on_stream, save_len, step_idx, **kwargs,
                 )
+                step_contents[0][step_idx] = step_buf[0]
+                step_status[step_idx] = "done"
+                return result, True
             except Exception as e:
                 logger.warning("步骤 '%s' 第 %d/%d 次失败: %s", label, attempt + 1, MAX_RETRIES, e)
                 if attempt + 1 >= MAX_RETRIES:
-                    raise
+                    logger.error("步骤 '%s' 已耗尽重试次数，跳过此步骤", label)
+                    step_status[step_idx] = "failed"
+                    step_errors[step_idx] = str(e)
+                    # 保留已流式内容 (如果有部分结果)
+                    return step_contents[0].get(step_idx, ""), False
                 # 重试：截断到步骤开始前，重新加 header
-                time.sleep(2)
+                time.sleep(2 ** attempt)  # 指数退避: 1s, 2s, 4s
                 accumulated[0] = accumulated[0][:save_len] + header
-                on_stream(accumulated[0])
+                step_contents[0][step_idx] = ""
+                on_stream(accumulated[0], step_idx, "")
 
     # Step 1: 笔记预处理
     _progress(5, "正在整理笔记...")
     logger.info("Step 1: 笔记预处理")
-    cleaned_notes = _call(
+    cleaned_notes, ok1 = _call(
         SYSTEM_PREPROCESS, f"学习日期：{date}\n\n{raw_notes}",
-        "笔记整理", 1, temperature=0.3, max_tokens=4000,
+        "笔记整理", 1, temperature=0.3, max_tokens=6000,
     )
 
     # Step 2: 知识图谱构建
     _progress(20, "构建知识图谱...")
     logger.info("Step 2: 知识图谱构建")
-    knowledge_graph = _call(
-        SYSTEM_KNOWLEDGE_GRAPH, cleaned_notes,
-        "知识图谱构建", 2, temperature=0.1, max_tokens=2000,
+    knowledge_graph, ok2 = _call(
+        SYSTEM_KNOWLEDGE_GRAPH, cleaned_notes if ok1 else raw_notes,
+        "知识图谱构建", 2, temperature=0.1, max_tokens=6000,
     )
 
     # Step 3: 面试题生成
     _progress(40, "正在生成面试题...")
     logger.info("Step 3: 面试题生成")
     system_gen = SYSTEM_INTERVIEW_GEN.replace("{position}", position)
-    interview_questions = _call(
-        system_gen, f"## 整理后的笔记\n\n{cleaned_notes}\n\n## 知识图谱\n\n{knowledge_graph}",
-        "面试题生成", 3, temperature=0.7, max_tokens=8000,
+    step3_input = f"## 整理后的笔记\n\n{cleaned_notes if ok1 else raw_notes}"
+    if ok2 and knowledge_graph:
+        step3_input += f"\n\n## 知识图谱\n\n{knowledge_graph}"
+    interview_questions, ok3 = _call(
+        system_gen, step3_input,
+        "面试题生成", 3, temperature=0.7, max_tokens=16000,
     )
 
     # Step 4: 质量审查
     _progress(65, "质量审查中...")
     logger.info("Step 4: 质量审查")
-    reviewed = _call(
-        SYSTEM_QUALITY_REVIEW, interview_questions,
-        "质量审查", 4, temperature=0.1, max_tokens=8000,
+    reviewed, ok4 = _call(
+        SYSTEM_QUALITY_REVIEW, interview_questions if ok3 else "",
+        "质量审查", 4, temperature=0.1, max_tokens=16000,
     )
 
     # Step 5: 扩展追问
     _progress(80, "生成补充练习题...")
     logger.info("Step 5: 扩展追问")
     system_ext = SYSTEM_EXTENSION.replace("{position}", position)
-    try:
-        extension = _call(
-            system_ext, knowledge_graph,
-            "补充练习题", 5, temperature=0.7, max_tokens=3000,
-        )
-    except Exception:
-        extension = ""
+    extension, ok5 = _call(
+        system_ext, knowledge_graph if ok2 else (cleaned_notes if ok1 else raw_notes),
+        "补充练习题", 5, temperature=0.7, max_tokens=8000,
+    )
 
-    # Step 6: 最终整合
+    # Step 6: 最终整合（流式输出 + 自动重试）
     _progress(90, "整合输出...")
     logger.info("Step 6: 最终整合")
     system_final = SYSTEM_FINAL_COMPILE.replace("{position}", position).replace("{date}", date)
-    final_input = f"## 质量审查后的面试题\n\n{reviewed}"
-    if extension:
-        final_input += f"\n\n## 扩展追问/补充题\n\n{extension}"
+    final_input_parts = []
+    if ok4 and reviewed:
+        final_input_parts.append(f"## 质量审查后的面试题\n\n{reviewed}")
+    elif ok3 and interview_questions:
+        final_input_parts.append(f"## 面试题\n\n{interview_questions}")
+    if ok5 and extension:
+        final_input_parts.append(f"\n\n## 扩展追问/补充题\n\n{extension}")
+    final_input = "\n\n".join(final_input_parts) if final_input_parts else "请基于学习笔记生成面试题。\n\n" + raw_notes
 
-    _step(6, "最终整合")
-    output = client.chat(
-        system=system_final,
-        user=final_input,
-        temperature=0.1,
-        max_tokens=8000,
+    output, ok6 = _call(
+        system_final, final_input,
+        "最终整合", 6, temperature=0.1, max_tokens=32768,
     )
-    if use_stream:
-        accumulated[0] = output
-        on_stream(accumulated[0])
+
+    if not ok6:
+        # _call 失败：用前几步已有内容拼凑输出
+        # (流式模式下 _call 已回滚 accumulated，只留了 header；
+        #  非流式模式下 accumulated 为空，不需要处理)
+        logger.warning("最终整合步骤失败，使用前几步内容拼接输出")
+        output_parts = []
+        if ok3 and interview_questions:
+            output_parts.append(interview_questions)
+        if ok5 and extension:
+            output_parts.append(extension)
+        output = "\n\n---\n\n".join(output_parts) if output_parts else ""
+        # 流式模式下补推 fallback 内容到 accumulated + on_stream
+        if use_stream and output:
+            fallback_note = "\n\n> ⚠️ 最终整合步骤失败，已合并已有内容\n\n"
+            accumulated[0] += fallback_note + output
+            step_contents[0][6] = fallback_note + output
+            on_stream(accumulated[0], 6, step_contents[0][6])
 
     # 统计题目数量
     question_count = output.count("**Q") + output.count("补充题")
 
     _progress(100, "生成完成！")
-    logger.info("流水线完成: %d 道题", question_count)
+    logger.info("流水线完成: %d 道题 (步骤状态: %s)", question_count, step_status)
 
     return {
         "output": output,
         "question_count": question_count,
-        "knowledge_graph": knowledge_graph,
+        "knowledge_graph": knowledge_graph if ok2 else "",
+        "step_contents": dict(step_contents[0]) if use_stream else {},
+        "step_status": dict(step_status),
+        "step_errors": dict(step_errors),
     }

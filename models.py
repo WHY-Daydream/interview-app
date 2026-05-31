@@ -1,14 +1,13 @@
 """SQLite 数据模型 — 用于本地持久化"""
-import json
 import re
 import time
 from datetime import datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, create_engine,
+    Boolean, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine,
+    event,
 )
 from sqlalchemy.orm import Session, declarative_base, relationship, selectinload
 
@@ -66,12 +65,15 @@ class KnowledgeGraph(Base):
 # ── 自测记录表 ──
 class QuizRecord(Base):
     __tablename__ = "quiz_records"
+    __table_args__ = (
+        UniqueConstraint("note_id", "question_index", name="uq_quiz_note_question"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     note_id = Column(Integer, ForeignKey("notes.id"), nullable=False)
     question_index = Column(Integer, nullable=False, comment="题目序号 (1-based)")
     mastered = Column(Boolean, nullable=False, comment="True=掌握, False=未掌握")
-    tested_at = Column(DateTime, default=datetime.utcnow)
+    tested_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     note = relationship("Note")
 
@@ -170,17 +172,20 @@ def _parse_question_fields(block: str, num: int, title: str, idx: int) -> dict:
 # ── 自测记录 CRUD ──
 
 def save_quiz_record(note_id: int, question_index: int, mastered: bool):
+    """Upsert 自测记录 — 存在则更新，不存在则插入"""
     with get_session() as session:
-        # 先删除同一条旧记录
-        session.query(QuizRecord).filter_by(
+        record = session.query(QuizRecord).filter_by(
             note_id=note_id, question_index=question_index
-        ).delete()
-        record = QuizRecord(
-            note_id=note_id,
-            question_index=question_index,
-            mastered=mastered,
-        )
-        session.add(record)
+        ).first()
+        if record:
+            record.mastered = mastered
+            record.tested_at = datetime.utcnow()
+        else:
+            session.add(QuizRecord(
+                note_id=note_id,
+                question_index=question_index,
+                mastered=mastered,
+            ))
         session.commit()
 
 
@@ -208,10 +213,19 @@ def get_engine():
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         _engine = create_engine(
             f"sqlite:///{db_path}",
-            connect_args={"check_same_thread": False},  # NiceGUI 多线程访问
+            connect_args={"check_same_thread": False},
         )
+        event.listen(_engine, "connect", _set_sqlite_pragma)
         Base.metadata.create_all(_engine)
     return _engine
+
+
+def _set_sqlite_pragma(dbapi_con, _rec):
+    """Enable WAL mode and foreign keys for better concurrent read performance."""
+    cur = dbapi_con.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA foreign_keys=ON")
+    cur.close()
 
 
 def get_session() -> Session:
