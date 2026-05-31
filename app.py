@@ -1,5 +1,6 @@
 """📚 每日学习笔记 → 岗位面试题生成器 — NiceGUI 主应用"""
 
+import asyncio
 import json
 import logging
 import os
@@ -1272,43 +1273,41 @@ def build_knowledge_graph_page():
     # 轮询：生成中每秒刷新，完成后自动加载
     global _KG_TIMER, _KG_POLL_ACTIVE, _KG_WAS_GENERATING
 
-    # 停用旧定时器（防止页面重建后产生孤儿 timer）
+    # 停用旧轮询任务（asyncio 任务可被彻底取消）
     if _KG_TIMER:
         try:
-            _KG_TIMER.deactivate()
+            _KG_TIMER.cancel()
         except Exception:
             pass
-        _KG_TIMER = None
 
     _KG_POLL_ACTIVE[0] = True
     _KG_WAS_GENERATING[0] = kg_state.generating
 
-    with _TIMER_ROOT:
-        _KG_TIMER = ui.timer(1.0, _kg_poll_cb, once=False)
+    _KG_TIMER = asyncio.create_task(_kg_poll_loop(), name='kg_poll')
 
 
-def _kg_poll_cb():
-    """KG 页面轮询回调（模块级，用全局状态避免 nonlocal 依赖）"""
-    global _KG_POLL_ACTIVE, _KG_WAS_GENERATING
-    if not _KG_POLL_ACTIVE[0]:
-        return
+async def _kg_poll_loop():
+    """KG 页面轮询协程：每秒检查生成状态，完成后自动加载笔记内容"""
     try:
-        with kg_state._lock:
-            generating = kg_state.generating
-        if _KG_WAS_GENERATING[0] and not generating:
-            _KG_WAS_GENERATING[0] = False
-            _on_kg_note_select(kg_state.current_note_id)
-            return
-        elif generating:
-            kg_content_area.refresh()
-        _KG_WAS_GENERATING[0] = generating
-    except RuntimeError as e:
-        if "parent slot" in str(e).lower():
-            _KG_POLL_ACTIVE[0] = False
-            return
-        raise
-    except Exception:
-        pass  # 页面切换间隙静默忽略
+        while _KG_POLL_ACTIVE[0]:
+            await asyncio.sleep(1.0)
+            try:
+                with kg_state._lock:
+                    generating = kg_state.generating
+                if _KG_WAS_GENERATING[0] and not generating:
+                    _KG_WAS_GENERATING[0] = False
+                    _on_kg_note_select(kg_state.current_note_id)
+                elif generating:
+                    kg_content_area.refresh()
+                _KG_WAS_GENERATING[0] = generating
+            except RuntimeError as e:
+                if "parent slot" in str(e).lower():
+                    break
+                raise
+            except Exception:
+                pass  # 页面切换间隙静默忽略
+    except asyncio.CancelledError:
+        pass
 
 
 # ══════════════════════════════════════════════════
@@ -1904,30 +1903,31 @@ def _start_generate():
     )
     invalidate_notes_cache()
 
-    # 取消旧的轮询定时器，再启动新的
+    # 取消旧的轮询任务，再启动新的（asyncio 任务可被彻底取消）
     if CURRENT_TIMER:
         try:
-            CURRENT_TIMER.deactivate()
+            CURRENT_TIMER.cancel()
         except Exception:
             pass
-    with _TIMER_ROOT:
-        CURRENT_TIMER = ui.timer(0.3, _safe_poll_task, once=False)
+    CURRENT_TIMER = asyncio.create_task(_task_poll_loop(), name='task_poll')
 
 
-def _safe_poll_task():
-    """安全包装 _poll_task，防止页面 slot 被删除时崩溃"""
+async def _task_poll_loop():
+    """轮询协程：每 0.3 秒检查任务状态，支持 asyncio 取消"""
     try:
-        if not _poll_task():
-            # _poll_task 返回 False → 停止轮询
-            _stop_timer()
-    except RuntimeError as e:
-        if "parent slot" in str(e).lower():
-            _stop_timer()
-            return
-        raise
-    except Exception:
-        _stop_timer()
-        raise
+        while True:
+            await asyncio.sleep(0.3)
+            try:
+                if not _poll_task():
+                    break
+            except RuntimeError as e:
+                if "parent slot" in str(e).lower():
+                    break
+                raise
+            except Exception:
+                break
+    except asyncio.CancelledError:
+        pass
 
 
 def _on_task_update(task_dict: dict):
@@ -2042,11 +2042,11 @@ def _poll_task():
 
 
 def _stop_timer():
-    """停止当前轮询定时器，并清除通知"""
+    """停止当前轮询异步任务，并清除通知"""
     global CURRENT_TIMER, GEN_NOTIFY
     if CURRENT_TIMER:
         try:
-            CURRENT_TIMER.deactivate()
+            CURRENT_TIMER.cancel()
         except Exception:
             pass
         CURRENT_TIMER = None
