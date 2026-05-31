@@ -2330,9 +2330,7 @@ if __name__ in {"__main__", "__mp_main__"}:
         )
     except Exception:
         _msg = traceback.format_exc()
-        # 写入诊断文件 + stderr
-        sys.stderr.write(f"[FATAL] {_msg}\n")
-        sys.stderr.flush()
+        # 写入诊断文件
         try:
             _STARTUP_LOG.write_text(
                 f"[{__import__('datetime').datetime.now().isoformat()}] CRASH:\n{_msg}\n",
@@ -2340,4 +2338,38 @@ if __name__ in {"__main__", "__mp_main__"}:
             )
         except Exception:
             pass
-        raise  # 让容器以非零状态退出，触发 Railway 重启循环
+        sys.stderr.write(f"[FATAL] {_msg}\n")
+        sys.stderr.flush()
+
+        # ── 兜底：启动简易 HTTP 服务器，在浏览器显示错误信息 ──
+        import http.server
+
+        _error_page = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>🚨 启动错误</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; padding: 2rem; background: #1a1a2e; color: #eee; }}
+  h1 {{ color: #ff6b6b; }}
+  pre {{ background: #16213e; padding: 1rem; border-radius: 8px; overflow-x: auto; white-space: pre-wrap; font-size: 14px; }}
+</style></head>
+<body>
+<h1>🚨 应用启动失败</h1>
+<pre>{_msg}</pre>
+</body></html>"""
+
+        class ErrorHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(_error_page.encode("utf-8"))
+
+            def log_message(self, fmt: str, *args: object) -> None:
+                sys.stderr.write(f"[FALLBACK] {fmt % args}\n")
+                sys.stderr.flush()
+
+        _port = settings.APP_PORT
+        sys.stderr.write(f"[FALLBACK] 启动兜底服务器于 0.0.0.0:{_port}\n")
+        sys.stderr.flush()
+        httpd = http.server.HTTPServer(("0.0.0.0", _port), ErrorHandler)
+        httpd.serve_forever()
