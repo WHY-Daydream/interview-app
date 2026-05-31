@@ -39,6 +39,9 @@ CURRENT_TASK_ID: Optional[str] = None
 CURRENT_TIMER = None  # 当前轮询定时器
 _TIMER_ROOT = None  # 定时器根容器（main_page 中初始化，parent slot 永不删除）
 _NAV_TABS = None  # 导航 tab 引用（用于跨页面跳转）
+_KG_TIMER = None  # 知识图谱页面轮询定时器（模块级生命周期管理，避免孤儿 timer）
+_KG_POLL_ACTIVE = [True]  # KG 轮询是否活跃
+_KG_WAS_GENERATING = [False]  # 上一次轮询时 KG 是否正在生成
 GEN_NOTIFY = None  # 当前生成进度通知对象（可 dismiss）
 _stream_step_mds: dict[int, ui.markdown] = {}  # 流式步骤 markdown 引用
 _result_step_mds: dict[int, ui.markdown] = {}  # 结果步骤 markdown 引用
@@ -1267,34 +1270,45 @@ def build_knowledge_graph_page():
     kg_content()
 
     # 轮询：生成中每秒刷新，完成后自动加载
-    _kg_poll_active = [True]
-    was_generating = [kg_state.generating]
+    global _KG_TIMER, _KG_POLL_ACTIVE, _KG_WAS_GENERATING
 
-    def _kg_poll_cb():
-        """KG 页面轮询回调（运行时自动捕获异常）"""
-        nonlocal was_generating
-        if not _kg_poll_active[0]:
-            return
+    # 停用旧定时器（防止页面重建后产生孤儿 timer）
+    if _KG_TIMER:
         try:
-            with kg_state._lock:
-                generating = kg_state.generating
-            if was_generating[0] and not generating:
-                was_generating[0] = False
-                _on_kg_note_select(kg_state.current_note_id)
-                return
-            elif generating:
-                kg_content_area.refresh()
-            was_generating[0] = generating
-        except RuntimeError as e:
-            if "parent slot" in str(e).lower():
-                _kg_poll_active[0] = False
-                return
-            raise
+            _KG_TIMER.deactivate()
         except Exception:
-            pass  # 页面切换间隙静默忽略
+            pass
+        _KG_TIMER = None
+
+    _KG_POLL_ACTIVE[0] = True
+    _KG_WAS_GENERATING[0] = kg_state.generating
 
     with _TIMER_ROOT:
-        _kg_timer = ui.timer(1.0, _kg_poll_cb, once=False)
+        _KG_TIMER = ui.timer(1.0, _kg_poll_cb, once=False)
+
+
+def _kg_poll_cb():
+    """KG 页面轮询回调（模块级，用全局状态避免 nonlocal 依赖）"""
+    global _KG_POLL_ACTIVE, _KG_WAS_GENERATING
+    if not _KG_POLL_ACTIVE[0]:
+        return
+    try:
+        with kg_state._lock:
+            generating = kg_state.generating
+        if _KG_WAS_GENERATING[0] and not generating:
+            _KG_WAS_GENERATING[0] = False
+            _on_kg_note_select(kg_state.current_note_id)
+            return
+        elif generating:
+            kg_content_area.refresh()
+        _KG_WAS_GENERATING[0] = generating
+    except RuntimeError as e:
+        if "parent slot" in str(e).lower():
+            _KG_POLL_ACTIVE[0] = False
+            return
+        raise
+    except Exception:
+        pass  # 页面切换间隙静默忽略
 
 
 # ══════════════════════════════════════════════════
