@@ -10,7 +10,7 @@ from datetime import date as date_today
 from typing import Optional
 
 # ── 编码修复（Windows GBK 兼容） ──
-sys.stdout.reconfigure(encoding="utf-8")  # type: ignore
+# sys.stdout.reconfigure(encoding="utf-8")  # type: ignore  # Railway 容器不支持
 
 from nicegui import app, ui
 
